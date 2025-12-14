@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 import sys, os
 sys.path.append(os.path.expanduser('~/Desktop/Pangal'))
-
+from scipy.interpolate import interp1d
 from pangal.spectrum import Spectrum
 
 from scipy.constants import c, parsec
@@ -14,22 +14,159 @@ import copy, glob, re, os
 import tempfile
 from tqdm import tqdm
 
+from astropy.io import fits
 from pcigale.sed import SED
 from pcigale.sed import utils
 from pcigale.sed_modules import get_module
 
-def truncated_boissier_sfh(V, R, Q_age, tau_Q, burst_factor, data):
 
-    # --- Select model data ---
-    v_array = np.array(list(data.keys()))
-    closest_v = v_array[np.argmin(np.abs(v_array - V))]
-    #print("Closest velocity:", closest_v)
 
-    r_array = np.array(list(data[closest_v].keys()))
-    closest_r = r_array[np.argmin(np.abs(r_array - R))]
-    #print("Closest radius:", closest_r)
 
-    selected_data = data[closest_v][closest_r]
+
+### --- LOADS BOISSIER UNPERTURBED MODELS --- ###
+# Base directory containing the “DISKEVOL.RES_L0.05_V*” files
+data_dir = "SFHs_Boissier/boissier_models_big_grid"
+
+# Pattern to match files without “lignes” in their name
+file_pattern = os.path.join(data_dir, "DISKEVOL.RES_L0.05_V*")
+
+# Regex to extract the integer velocity after “_V”
+vel_pattern = re.compile(r"_V(\d+)")
+# First, collect (velocity, full_path) pairs
+velocity_files = []
+for full_path in glob.glob(file_pattern):
+    fname = os.path.basename(full_path)
+    if "lignes" in fname:
+        continue
+    m = vel_pattern.search(fname)
+    if not m:
+        continue
+    velocity = int(m.group(1))
+    velocity_files.append((velocity, full_path))
+
+# Sort by velocity (ascending)
+velocity_files.sort(key=lambda vf: vf[0])
+
+# Now build the dictionary in sorted order
+boissier_models = {}
+for velocity, full_path in velocity_files:
+    boissier_models[velocity] = {}   # Initialize nested dict for this velocity
+
+    current_radius = None
+    boissier_models_by_radius = {}   # Temporary storage: radius → list of rows
+
+    with open(full_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("99999"):
+                # Skip empty lines or separator lines
+                continue
+
+            if line.startswith("R ="):
+                parts = line.split()
+                try:
+                    # Parse “R = 1.24 kpc” → radius = 1.24
+                    current_radius = float(parts[2])
+                    boissier_models_by_radius[current_radius] = []
+                except (IndexError, ValueError):
+                    current_radius = None
+                continue
+
+            if current_radius is None:
+                continue
+
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+
+            try:
+                # Convert columns 1–5 to float
+                row = [float(x) for x in parts[1:6]]
+                boissier_models_by_radius[current_radius].append(row)
+            except ValueError:
+                continue
+
+    # Convert each list of rows into a NumPy array, then store under data[velocity]
+    for radius, rows in boissier_models_by_radius.items():
+        boissier_models[velocity][radius] = np.array(rows)
+        
+        
+        
+        
+def unperturbed_boissier_sfh(V, R, t_common=None):
+
+    if t_common is None:
+        t_common = np.linspace(0, 13.5, 300)
+
+    V_grid = np.array(sorted(boissier_models.keys()))
+
+    if not (V_grid.min() <= V <= V_grid.max()):
+        raise ValueError(f"V={V} outside range")
+
+    sfh_at_V = []
+
+    for Vg in V_grid:
+
+        radius_dict = boissier_models[Vg]
+        R_grid = np.array(sorted(radius_dict.keys()))
+
+        """
+        if not (R_grid.min() <= R <= R_grid.max()):
+            raise ValueError(
+                f"R={R} outside range {R_grid.min()}–{R_grid.max()}"
+            )
+        """
+
+        # --- resample all radii at this V ---
+        sfh_resampled = []
+        for Rg in R_grid:
+            sfh = radius_dict[Rg]
+            sfh_resampled.append(resample_sfh(sfh, t_common))
+
+        sfh_resampled = np.stack(sfh_resampled, axis=0)
+        # shape: (N_R, N_time, N_cols)
+
+        # --- interpolate in radius ---
+        sfh_R = np.array([
+            np.interp(R, R_grid, sfh_resampled[:, i, j])
+            for i in range(len(t_common))
+            for j in range(sfh_resampled.shape[2])
+        ]).reshape(len(t_common), -1)
+
+        sfh_at_V.append(sfh_R)
+
+    sfh_at_V = np.stack(sfh_at_V, axis=0)
+    # shape: (N_V, N_time, N_cols)
+
+    # --- interpolate in V ---
+    sfh_final = np.array([
+        np.interp(V, V_grid, sfh_at_V[:, i, j])
+        for i in range(len(t_common))
+        for j in range(sfh_at_V.shape[2])
+    ]).reshape(len(t_common), -1)
+
+    return sfh_final
+
+def resample_sfh(sfh, t_common):
+    t = sfh[:, 0]
+    out = np.zeros((len(t_common), sfh.shape[1]))
+    out[:, 0] = t_common
+
+    for col in range(1, sfh.shape[1]):
+        out[:, col] = np.interp(
+            t_common, t, sfh[:, col],
+            left=sfh[0, col],
+            right=sfh[-1, col]
+        )
+    return out
+
+
+
+
+def truncated_boissier_sfh(V, R, Q_age, tau_Q, burst_factor,):
+
+    
+    unperturbed_model = unperturbed_boissier_sfh(V,R)
     
     AGE = 13500  # Myr    
 
@@ -41,8 +178,8 @@ def truncated_boissier_sfh(V, R, Q_age, tau_Q, burst_factor, data):
 
 
     # --- CIGALE SFH grid setup ---
-    t_myr = selected_data[:, 0] * 1000.0
-    sfr_myr = selected_data[:, 2]
+    t_myr = unperturbed_model[:, 0] * 1000.0
+    sfr_myr = unperturbed_model[:, 2]
     full_time_grid = np.arange(0, AGE + 1)
 
     interp = np.interp(full_time_grid, t_myr, sfr_myr, left=0.0, right=0.0)
@@ -61,9 +198,9 @@ def truncated_boissier_sfh(V, R, Q_age, tau_Q, burst_factor, data):
     return full_time_grid, sfr_trunc
 
 
-def truncated_boissier_sed(V, R, Q_age, tau_Q, burst_factor, metallicity, data, AGE=13500):
+def truncated_boissier_sed(V, R, Q_age, tau_Q, burst_factor, metallicity, AGE=13500):
     
-    full_time_grid, sfr_trunc = truncated_boissier_sfh(V, R, Q_age, tau_Q, burst_factor, data=data)
+    full_time_grid, sfr_trunc = truncated_boissier_sfh(V, R, Q_age, tau_Q, burst_factor,)
 
     with tempfile.NamedTemporaryFile(suffix=".dat", delete=False) as tmp:
         for ti, si in zip(full_time_grid, sfr_trunc):
@@ -96,15 +233,14 @@ def truncated_boissier_sed(V, R, Q_age, tau_Q, burst_factor, metallicity, data, 
     return spec
 
 # Creates many models
-def build_boissier_SEDs(V, R, SFH_QUENCHING_AGE, SFH_QUENCHING_TAU, BURST_FACTORS, METALLICITIES,
-                            data, filename=None):
+def build_boissier_SEDs(V, R, SFH_QUENCHING_AGE, SFH_QUENCHING_TAU, BURST_FACTORS, METALLICITIES, filename=None):
 
     combos = list(itertools.product(SFH_QUENCHING_AGE, SFH_QUENCHING_TAU, BURST_FACTORS, METALLICITIES))
     print(f"Generating {len(combos)} models")
 
     models = []
     for Q_age, tau_Q, burst_factor, metallicity in tqdm(combos, desc="Processing combinations"):
-        spec = truncated_boissier_sed(V, R, Q_age, tau_Q, burst_factor, metallicity, data=data)
+        spec = truncated_boissier_sed(V, R, Q_age, tau_Q, burst_factor, metallicity,)
         models.append(spec)
 
     if filename:
